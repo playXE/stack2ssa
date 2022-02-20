@@ -1,4 +1,6 @@
 use codegen::isa;
+use cranelift::codegen::ir::StackSlot;
+use cranelift::prelude::StackSlotData;
 use cranelift::prelude::{codegen::isa::*, Signature};
 use cranelift::{
     codegen::ir,
@@ -154,7 +156,7 @@ impl BasicBlock {
 
 pub struct Stack2SSA<'a> {
     builder: FunctionBuilder<'a>,
-    locals: Vec<Variable>,
+    locals: StackSlot,
     operand_stack: Vec<ir::Value>,
     code: &'a Vec<Op>,
     instr_index: usize,
@@ -177,7 +179,8 @@ impl<'a> Stack2SSA<'a> {
                 block.stack_state.len()
             );
             self.operand_stack.clear();
-            self.operand_stack.extend_from_slice(&block.stack_state);
+            let params = self.builder.block_params(block.block);
+            self.operand_stack.extend_from_slice(&params);
             self.current_block = block;
 
             self.generate_from(self.current_block.low);
@@ -192,7 +195,9 @@ impl<'a> Stack2SSA<'a> {
         self.end_of_basic_block = true;
         *self.blocks.entry(offset).or_insert_with(|| {
             let block = self.builder.create_block();
-
+            for _ in 0..self.operand_stack.len() {
+                self.builder.append_block_param(block, types::I32);
+            }
             let mut bb = BasicBlock::new(offset as _, block);
 
             bb.stack_state = self.operand_stack.clone().into_boxed_slice();
@@ -215,17 +220,24 @@ impl<'a> Stack2SSA<'a> {
             let mut s = None;
             match code {
                 Op::Get(off) => {
-                    let index = self.operand_stack.len() as isize + off as isize;
+                    let index = self.operand_stack.len() as isize - 1 + off as isize;
                     let val = self.operand_stack[index as usize];
                     self.operand_stack.push(val);
                 }
                 Op::LGet(ix) => {
-                    let var = self.builder.use_var(Variable::with_u32(ix as _));
-                    self.operand_stack.push(var);
+                    //let var = self.builder.use_var(Variable::with_u32(ix as _));
+                    //self.operand_stack.push(var);
+                    let value =
+                        self.builder
+                            .ins()
+                            .stack_load(types::I32, self.locals, ix as i32 * 4);
+                    self.operand_stack.push(value);
                 }
                 Op::LSet(ix) => {
                     let val = self.operand_stack.pop().unwrap();
-                    self.builder.def_var(Variable::with_u32(ix as _), val);
+                    self.builder
+                        .ins()
+                        .stack_store(val, self.locals, ix as i32 * 4);
                 }
                 Op::Push(value) => {
                     let x = self.builder.ins().iconst(types::I32, value as i64);
@@ -237,7 +249,7 @@ impl<'a> Stack2SSA<'a> {
                 Op::Jump(x) => {
                     if x != self.instr_index as u32 {
                         let target = self.get_or_create_block(x);
-                        s = Some(self.builder.ins().jump(target, &[]));
+                        s = Some(self.builder.ins().jump(target, &self.operand_stack));
                     }
                 }
                 Op::JumpIfNotZero(target) => {
@@ -245,7 +257,7 @@ impl<'a> Stack2SSA<'a> {
                     let x = self.operand_stack.pop().unwrap();
                     let target = self.get_or_create_block(target);
 
-                    s = Some(self.builder.ins().brnz(x, target, &[]));
+                    s = Some(self.builder.ins().brnz(x, target, &self.operand_stack));
                     self.end_of_basic_block = true;
                 }
 
@@ -254,7 +266,7 @@ impl<'a> Stack2SSA<'a> {
                     let x = self.operand_stack.pop().unwrap();
                     let target = self.get_or_create_block(target);
 
-                    s = Some(self.builder.ins().brz(x, target, &[]));
+                    s = Some(self.builder.ins().brz(x, target, &self.operand_stack));
                     self.end_of_basic_block = true;
                 }
                 Op::Ret => {
@@ -353,7 +365,7 @@ impl<'a> Stack2SSA<'a> {
             if self.end_of_basic_block {
                 if self.fallthrough {
                     let block = self.get_or_create_block(index as _);
-                    self.builder.ins().jump(block, &[]);
+                    self.builder.ins().jump(block, &self.operand_stack);
                 }
                 return;
             }
@@ -415,14 +427,10 @@ impl JIT {
         let mut bmap = BTreeMap::new();
         bmap.insert(0, entry_block);
         let current_block = BasicBlock::new(0, entry_block);
-        let locals = {
-            let mut v = vec![];
-            for i in 0..locals {
-                v.push(Variable::with_u32(i as _));
-                builder.declare_var(Variable::with_u32(i as _), types::I32);
-            }
-            v
-        };
+        let locals = builder.create_stack_slot(StackSlotData::new(
+            cranelift::prelude::StackSlotKind::ExplicitSlot,
+            locals as u32 * 4,
+        ));
         let mut compiler = Stack2SSA {
             builder,
             operand_stack,
